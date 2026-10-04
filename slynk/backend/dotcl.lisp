@@ -275,10 +275,58 @@
   (declare (ignore object))
   nil)
 
-;;;; Debugging (stubs)
+;;;; Debugging
+
+;;; DOTCL:BACKTRACE-WITH-ARGS lists the Lisp call stack, innermost first,
+;;; one (NAME ARG...) per frame; NAME is the function's name as a string,
+;;; without its package.  Only named functions have a frame.  The stack is
+;;; taken once on entry to the debugger, and the frames of the debugger
+;;; itself are cut off the top.
+;;;
+;;; DOTCL:FRAME-LOCALS numbers frames from the innermost frame at the time
+;;; of the call, so a frame is remembered by its depth (frames between it
+;;; and the bottom of the stack, itself included) and converted back to an
+;;; index when asked.
+
+(defvar *sly-db-frames* #()
+  "Frames being debugged, innermost first, as (NAME ARG...) lists.")
+
+(defvar *sly-db-bottom-depth* 0
+  "Depth of the innermost frame in *SLY-DB-FRAMES*.")
+
+(defparameter *debugger-entry-frames*
+  '("INVOKE-SLY-DEBUGGER" "SLYNK-DEBUGGER-HOOK")
+  "Frames through which slynk enters the debugger.  The innermost of them
+and everything inside it belong to the debugger and are not shown.  (An
+outer one belongs to an outer debugger level, whose frames are shown.)")
+
+(defparameter *debugger-glue-frames*
+  '("CALL-WITH-DEBUGGER-HOOK" "INVOKE-DEBUGGER" "SLYNK-DEBUGGER-HOOK")
+  "Frames just outside an entry frame that are still part of entering the
+debugger.")
+
+(defun debugger-frame-count (frames)
+  "How many of FRAMES, innermost first, belong to the debugger."
+  (let ((entry (position-if (lambda (f) (member (car f) *debugger-entry-frames*
+                                                 :test #'string=))
+                            frames)))
+    (cond (entry
+           (loop for i from (1+ entry)
+                 for f in (nthcdr (1+ entry) frames)
+                 while (member (car f) *debugger-glue-frames* :test #'string=)
+                 finally (return i)))
+          (t
+           ;; Entered some other way: drop only this function's own frame.
+           (let ((self (position "CALL-WITH-DEBUGGING-ENVIRONMENT" frames
+                                 :key #'car :test #'string=)))
+             (if self (1+ self) 0))))))
 
 (defimplementation call-with-debugging-environment (debugger-loop-fn)
-  (funcall debugger-loop-fn))
+  (let* ((frames (dotcl:backtrace-with-args))
+         (skip (debugger-frame-count frames))
+         (*sly-db-frames* (coerce (nthcdr skip frames) 'vector))
+         (*sly-db-bottom-depth* (- (length frames) skip)))
+    (funcall debugger-loop-fn)))
 
 (defimplementation call-with-debugger-hook (hook fun)
   (let ((*debugger-hook* hook))
@@ -288,31 +336,116 @@
   (setf *debugger-hook* function))
 
 (defimplementation compute-backtrace (start end)
-  (declare (ignore start end))
-  nil)
+  (let ((n (length *sly-db-frames*)))
+    (coerce (subseq *sly-db-frames* (min start n) (if end (min end n) n))
+            'list)))
+
+(defun nth-frame (index)
+  (if (< -1 index (length *sly-db-frames*))
+      (aref *sly-db-frames* index)
+      (error "No frame ~D." index)))
 
 (defimplementation print-frame (frame stream)
-  (format stream "~A" frame))
+  ;; The name is a string, but it reads as the symbol it stands for, so it
+  ;; is written as text, not printed.
+  (write-char #\( stream)
+  (write-string (car frame) stream)
+  (dolist (arg (cdr frame))
+    (write-char #\Space stream)
+    (prin1 arg stream))
+  (write-char #\) stream))
+
+(defun frame-function-symbol (name)
+  "The symbol naming the function a frame called NAME runs.  Frames do not
+record the package, so the accessible symbol is preferred and otherwise a
+fbound symbol of that name in any package is taken."
+  (let ((here (find-symbol name *package*)))
+    (if (and here (fboundp here))
+        here
+        (let ((found nil))
+          (do-all-symbols (s)
+            (when (and (string= (symbol-name s) name) (fboundp s))
+              (when (or (null found)
+                        (and (not (dotcl:function-source-location found))
+                             (dotcl:function-source-location s)))
+                (setq found s))))
+          found))))
+
+(defimplementation frame-package (frame-number)
+  (let ((sym (frame-function-symbol (car (nth-frame frame-number)))))
+    (and sym (symbol-package sym))))
 
 (defimplementation frame-source-location (frame-number)
-  (declare (ignore frame-number))
-  nil)
+  (let* ((name (car (nth-frame frame-number)))
+         (sym (frame-function-symbol name))
+         (loc (and sym (dotcl:function-source-location sym))))
+    (if loc
+        (make-location (list :file (namestring (truename (getf loc :file))))
+                       (list :line (getf loc :line)))
+        (make-error-location "No source location for ~A." name))))
+
+(defun local-name (name frame-number)
+  (or (find-symbol name (or (ignore-errors (frame-package frame-number))
+                            *package*))
+      (make-symbol name)))
+
+(defun frame-argument-names (frame)
+  "Names for a frame's arguments: the required and optional parameters of
+its function where the lambda list is known, ARGn for the rest."
+  (let* ((sym (frame-function-symbol (car frame)))
+         (ll (and sym (ignore-errors (dotcl:function-lambda-list sym))))
+         (names '()))
+    (loop for p in ll
+          until (member p '(&rest &body &key &aux &allow-other-keys))
+          unless (eq p '&optional)
+            do (push (symbol-name (if (consp p) (car p) p)) names))
+    (loop for i from 0 below (length (cdr frame))
+          collect (or (nth i (reverse names)) (format nil "ARG~D" i)))))
+
+(defun frame-variables (frame-number)
+  "(NAME . VALUE) pairs for a frame: its recorded lexical variables when the
+code was compiled with DOTCL:*EMIT-FRAME-LOCALS* true, else its arguments."
+  (let* ((frame (nth-frame frame-number))
+         ;; DOTCL:FRAME-LOCALS counts from the innermost frame of this call,
+         ;; so the stack is measured here, not in a helper with a frame of
+         ;; its own.
+         (here (length (dotcl:backtrace)))
+         (recorded (dotcl:frame-locals
+                    (- here (- *sly-db-bottom-depth* frame-number)))))
+    (or recorded
+        (mapcar #'cons (frame-argument-names frame) (cdr frame)))))
+
+(defimplementation frame-locals (frame-number)
+  ;; ID tells apart variables of the same name; Emacs shows it after the
+  ;; name when it is not 0.
+  (loop for (name . value) in (frame-variables frame-number)
+        for seen = (list name) then (cons name seen)
+        collect (list :name (local-name name frame-number)
+                      :id (1- (count name seen :test #'string=))
+                      :value value)))
+
+(defimplementation frame-var-value (frame-number index)
+  ;; INDEX is the variable's position in FRAME-LOCALS.
+  (cdr (nth index (frame-variables frame-number))))
 
 (defimplementation frame-catch-tags (frame-number)
   (declare (ignore frame-number))
   nil)
 
-(defimplementation frame-locals (frame-number)
-  (declare (ignore frame-number))
-  nil)
-
-(defimplementation frame-var-value (frame-number var-id)
-  (declare (ignore frame-number var-id))
-  nil)
-
 (defimplementation eval-in-frame (form frame-number)
-  (declare (ignore frame-number))
-  (eval form))
+  ;; The frame's variables are bound lexically around FORM.  A name FORM
+  ;; mentions was interned when FORM was read, so FIND-SYMBOL finds it.
+  (let ((bindings
+          (loop for (name . value) in (remove-duplicates
+                                       (frame-variables frame-number)
+                                       :key #'car :test #'string=
+                                       :from-end t)
+                for sym = (find-symbol name *package*)
+                when (and sym (not (constantp sym)))
+                  collect (list sym (list 'quote value)))))
+    (eval `(let ,bindings
+             (declare (ignorable ,@(mapcar #'car bindings)))
+             ,form))))
 
 (defimplementation print-condition (condition stream)
   (format stream "~A" condition))
