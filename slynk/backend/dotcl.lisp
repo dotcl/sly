@@ -38,7 +38,7 @@
   "dotcl")
 
 (defimplementation getpid ()
-  0) ; TODO: implement via .NET Process.GetCurrentProcess().Id
+  (dotcl:getpid))
 
 (defimplementation command-line-args ()
   nil)
@@ -51,28 +51,13 @@
 (defimplementation preferred-communication-style ()
   :spawn)
 
-;;;; UTF-8 encoding (via System.Text.Encoding.UTF8)
-
-(defun %utf8-encoding ()
-  (dotnet:static "System.Text.Encoding" "get_UTF8"))
+;;;; UTF-8 encoding
 
 (defimplementation string-to-utf8 (string)
-  "Encode STRING to a CL (unsigned-byte 8) vector via .NET's UTF-8 encoder."
-  (let* ((bytes (dotnet:invoke (%utf8-encoding) "GetBytes" string))
-         (n     (dotnet:invoke bytes "get_Length"))
-         (out   (make-array n :element-type '(unsigned-byte 8))))
-    (dotimes (i n out)
-      ;; D1468: a Byte[] element comes back as a real CL integer, no unboxing needed.
-      (setf (aref out i) (aref bytes i)))))
+  (dotcl:string-to-octets string :external-format :utf-8))
 
 (defimplementation utf8-to-string (octets)
-  "Decode a CL (unsigned-byte 8) sequence of UTF-8 OCTETS to a string via .NET."
-  (let* ((n     (length octets))
-         (bytes (dotnet:make-array "System.Byte" n)))
-    (dotimes (i n)
-      ;; D1469: a CL Fixnum stores straight into a Byte[] element.
-      (setf (aref bytes i) (elt octets i)))
-    (dotnet:invoke (%utf8-encoding) "GetString" bytes)))
+  (dotcl:octets-to-string octets :external-format :utf-8))
 
 ;;;; TCP Server (using dotcl-socket)
 
